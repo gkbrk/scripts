@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import time
 import secretstorage
+import json
 from selenium import webdriver
 from selenium.webdriver.common.action_chains import ActionChains
 
@@ -9,7 +10,9 @@ from bs4 import BeautifulSoup
 def get_credentials():
     bus = secretstorage.dbus_init()
     collection = secretstorage.get_default_collection(bus)
-    return next(collection.search_items({'application': 'barclays'})).get_attributes()
+    collection.unlock()
+    secret = next(collection.search_items({'application': 'barclays'})).get_secret()
+    return json.loads(secret)
 
 def login(driver):
     driver.get('https://bank.barclays.co.uk')
