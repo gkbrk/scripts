@@ -1,0 +1,63 @@
+#!/bin/sh
+
+TARGET=$1
+if [ -z "${TARGET}" ]
+then
+    echo "Please give a target file."
+    exit 1
+fi
+shift
+
+ACTION=$1
+if [ -z "${ACTION}" ]
+then
+    ACTION="ls"
+else
+    shift
+fi
+
+strikeGrep='^~.*~$'
+
+strikeP () {
+    echo "$@" | grep -q -E "${strikeGrep}"
+}
+
+trimEmptyLines () {
+    sed -i "/^$/d" "$1"
+}
+
+case ${ACTION} in
+    ls|show)
+        i=0
+        while read -r p; do
+            echo "${i} - ${p}";
+            i=$((i + 1))
+        done <"${TARGET}"
+        ;;
+    add)
+        echo "$@" >> "${TARGET}"
+        ;;
+    strike)
+        targetLine=$1
+        targetLine=$((targetLine + 1))
+        echo "${targetLine}"
+        lineText=$(sed "${targetLine}q;d" "${TARGET}")
+        echo "${lineText}"
+        if strikeP "${lineText}"
+        then
+            sed -i "${targetLine} s/^~\(.*\)~$/\1/" "${TARGET}"
+        else
+            sed -i "${targetLine} s/^.*$/~\0~/" "${TARGET}"
+        fi
+        ;;
+    sink)
+        strikeLines=$(grep -E "${strikeGrep}" "${TARGET}")
+        noStrikeLines=$(grep -v -E "${strikeGrep}" "${TARGET}")
+        echo "${noStrikeLines}" > "${TARGET}"
+        echo "${strikeLines}" >> "${TARGET}"
+        trimEmptyLines "${TARGET}"
+        ;;
+    *)
+        echo "Unknown action"
+        ;;
+esac
