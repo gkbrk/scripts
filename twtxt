@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+import os
+import subprocess
+import hashlib
+import time
+
+config_values = {}
+follows = []
+
+
+def config_lines():
+    default = os.path.expanduser("~/.config")
+    config_home = os.environ.get("XDG_CONFIG_HOME", default)
+    config_file = f"{config_home}/twtxt"
+    with open(config_file, "rb") as conf:
+        for line in conf:
+            line = line.strip()
+            if not line:
+                continue
+            yield line
+
+
+def cache(key, func, ttl=60):
+    default = os.path.expanduser("~/.cache")
+    cache_home = os.environ.get("XDG_CACHE_HOME", default)
+    cache_dir = f"{cache_home}/twtxt"
+    hashkey = hashlib.md5(key.encode("utf-8")).hexdigest()
+    cache_file = f"{cache_dir}/{hashkey}"
+    try:
+        with open(cache_file, "rb") as f:
+            ts = int(f.readline().strip())
+            if time.time() - ts < ttl:
+                return f.read()
+    except:
+        pass
+    try:
+        os.makedirs(cache_dir)
+    except:
+        pass
+    result = func()
+    with open(cache_file, "wb+") as f:
+        f.write(f"{int(time.time())}\n".encode("ascii"))
+        f.write(result)
+    return result
+
+
+for line in config_lines():
+    action, data = line.split(b" ", 1)
+
+    if action == b"set":
+        name, value = data.split(b" ", 1)
+        config_values[name] = value
+    elif action == b"follow":
+        nick, url = data.split(b" ", 1)
+        follows.append((nick, url))
+
+
+def user_agent():
+    user_agent = "twtxt/0.0.0"
+    if b"url" in config_values and b"nick" in config_values:
+        url = config_values[b"url"].decode("utf-8")
+        nick = config_values[b"nick"].decode("utf-8")
+        user_agent += f" (+{url}; @{nick})"
+    return user_agent
+
+
+def parse_post(post):
+    post = post.strip()
+    try:
+        if post[0] == b"#":
+            return
+        date, body = post.split(b"\t", 1)
+        return date, body
+    except:
+        pass
+
+
+def curl_fetch(url):
+    def inner():
+        try:
+            result = subprocess.run(
+                ["curl", "-H", f"User-Agent: {user_agent()}", url],
+                timeout=int(config_values.get("timeout", "5")),
+                capture_output=True,
+                check=True,
+            )
+            return result.stdout
+        except:
+            return b""
+
+    return cache(f"curl_{url}", inner, 60 * 15)
+
+
+def fetch_url(url):
+    lines = curl_fetch(url).split(b"\n")
+    for line in lines:
+        post = parse_post(line)
+        if not post:
+            continue
+        yield post
+
+
+def get_posts():
+    for nick, url in follows:
+        for date, body in fetch_url(url):
+            yield nick, date, body
+
+
+if __name__ == "__main__":
+    posts = list(get_posts())
+    posts.sort(key=lambda x: x[1])
+    for nick, date, body in posts[-30:]:
+        nick = nick.decode("utf-8")
+        date = date.decode("ascii")
+        body = body.decode("utf-8")
+        print(f"  {nick:10}\t{date}\n\n\t{body}\n\n{'-'*80}\n")
