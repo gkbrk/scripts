@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+
+# Issue Tracker: Bug and issue tracker CGI script
+# Copyright (C) 2020 Gokberk Yaltirakli
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+import cgiapp
+from cgiapp import el, opentag, closetag
+from collections import namedtuple
+import time
+
+DBFILE = "test.tsv"
+
+Row = namedtuple("Row", "timestamp id status body")
+Issue = namedtuple("Issue", "id title status lastupdate rows")
+
+
+def get_rows():
+    try:
+        with open(DBFILE, "r+") as dbfile:
+            for line in dbfile:
+                parts = line.strip().split("\t")
+                yield Row(*parts)
+    except:
+        return []
+
+
+def get_issue(issueId):
+    title = None
+    lastUpdate = None
+    status = None
+    rows = []
+
+    f = filter(lambda x: x.id == issueId, get_rows())
+    for row in sorted(f, key=lambda x: x.timestamp):
+        if title is None:
+            title = row.body
+        lastUpdate = row.timestamp
+        status = row.status
+        rows.append(row)
+    return Issue(issueId, title, status, lastUpdate, rows)
+
+def append_row(row):
+    with open(DBFILE, "a+") as dbfile:
+        dbfile.write(f"{row.timestamp}\t{row.id}\t{row.status}\t{row.body}\n")
+
+
+def get_issues():
+    issues = set([row.id for row in get_rows()])
+    yield from map(get_issue, issues)
+
+def get_id():
+    issues = list(get_issues())
+    if issues:
+        return max(map(lambda x: int(x.id), get_issues())) + 1
+    else:
+        return 1
+
+def format_time(t):
+    return time.strftime("%Y-%m-%d %H:%M", time.gmtime(int(t)))
+
+
+@cgiapp.action("home")
+def home():
+    yield el("h1", "Issue tracker")
+    showClosed = cgiapp.getfirst('showclosed') is not None
+    if not showClosed:
+        yield el("a", "Show closed", href="?a=home&showclosed=1")
+    else:
+        yield el("a", "Hide closed", href="?a=home")
+    yield el("br")
+
+    yield opentag("form", method="POST", action="?a=appendrow")
+    yield el("input", type="text", placeholder="Issue title...", name="body")
+    yield el("input", type="submit", value="Create issue")
+    yield closetag("form")
+
+    yield opentag("table", border=1)
+    yield opentag("tr")
+    yield el("th", "ID")
+    yield el("th", "Status")
+    yield el("th", "Last updated")
+    yield el("th", "Title")
+    yield el("th", "Action")
+    yield closetag("tr")
+
+
+    for issue in sorted(get_issues(), key=lambda x: x.lastupdate, reverse=True):
+        if issue.status == 'closed' and not showClosed: continue
+        yield opentag("tr")
+        yield el("td", issue.id)
+        yield el("td", issue.status)
+        yield el("td", format_time(issue.lastupdate))
+        yield el("td", issue.title)
+        yield el("td", el("a", "View", href=f"?a=view&id={issue.id}"))
+        yield closetag("tr")
+    yield closetag("table")
+
+
+@cgiapp.action("view")
+def view():
+    issueId = cgiapp.getfirst("id")
+    issue = get_issue(issueId)
+    yield el("a", "Home", href="?a=home")
+    yield el("h1", f"Viewing issue: {issue.title}")
+
+    yield opentag("form", method="POST", action="?a=appendrow")
+    yield el("input", type="text", value=issue.status, name="status")
+    yield el("br")
+    yield el("textarea", placeholder="Body...", name="body")
+    yield el("br")
+    yield el("input", type="hidden", name="id", value=issueId)
+    yield el("input", type="submit", value="Add comment")
+    yield closetag("form")
+
+    yield opentag("table", border=1)
+    yield opentag("tr")
+    yield el("th", "Timestamp")
+    yield el("th", "Status")
+    yield el("th", "Body")
+    yield closetag("tr")
+
+    for row in issue.rows:
+        yield opentag("tr")
+        yield el("td", format_time(row.timestamp))
+        yield el("td", row.status)
+        yield el("td", row.body)
+        yield closetag("tr")
+
+    yield closetag("table")
+
+@cgiapp.action("appendrow")
+def appendrow():
+    body = cgiapp.getfirst("body", '').replace('\n', '  ')
+    status = cgiapp.getfirst("status", "open")
+    issueId = cgiapp.getfirst("id")
+    if issueId is None:
+        issueId = get_id()
+    append_row(Row(int(time.time()), issueId, status, body))
+    cgiapp.header('Location', '?a=home')
+    cgiapp.header('Status', '301 Redirect')
+    yield ''
+
+cgiapp.run()
