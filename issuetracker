@@ -74,6 +74,7 @@ def format_time(t):
 
 @cgiapp.action("home")
 def home():
+    yield el("title", "Issue tracker")
     yield el("h1", "Issue tracker")
     showClosed = cgiapp.getfirst('showclosed') is not None
     if not showClosed:
@@ -136,14 +137,14 @@ def view():
         yield opentag("tr")
         yield el("td", format_time(row.timestamp))
         yield el("td", row.status)
-        yield el("td", row.body)
+        yield el("td", row.body, style="max-width: 40em;")
         yield closetag("tr")
 
     yield closetag("table")
 
 @cgiapp.action("appendrow")
 def appendrow():
-    body = cgiapp.getfirst("body", '').replace('\n', '  ')
+    body = cgiapp.getfirst("body", '').replace('\r', '').replace('\n', '  ')
     status = cgiapp.getfirst("status", "open")
     issueId = cgiapp.getfirst("id")
     if issueId is None:
