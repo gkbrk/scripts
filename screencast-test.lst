@@ -1,0 +1,21 @@
+dl 2
+sd 0.1
+tl clear
+tl # Test line
+tl echo "kekw" | cowsay
+dl 2
+tl
+tl vim ip.sh
+tl i#!/bin/sh
+tl curl https://icanhazip.com
+dl 2
+es
+tl :wq
+tl
+tl chmod +x ip.sh
+tl ./ip.sh
+dl 1
+tl rm ip.sh
+dl 3
+tl clear
+dl 1
