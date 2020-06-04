@@ -21,7 +21,7 @@
 from pathlib import Path
 from collections import namedtuple
 from itertools import cycle
-import os, sys, argparse
+import os, sys, argparse, re
 
 # Self-contained, limited implementation of the Ninja build system
 
@@ -36,7 +36,7 @@ import os, sys, argparse
 # You can find the manual at https://ninja-build.org/manual.html.  With all the
 # license stuff and disclaimers out of the way, let's begin.
 
-#-------------------------------------------------------------------------------
+# -------------------------------------------------------------------------------
 
 # Parse the supported command line arguments. We could ignore most of these, but
 # they don't inflate the code too much so it's worth the extra flexibility.
@@ -74,111 +74,117 @@ if not build_file.exists():
 
 lines = []
 with open(build_file) as bf:
+    bf = iter(bf)
     for line in bf:
-        lines.append(line.rstrip())
+        line = line.rstrip()
+
+        # Ignore empty lines
+        if not line:
+            continue
+        # Ignore comments
+        if line.lstrip().startswith("#"):
+            continue
+
+        while line.endswith("$"):
+            line = line[:-1] + next(bf).strip()
+
+        lines.append(line)
 
 # ------------------------------------------------------------------------------
 
-# If everything went well, we are ready to parse the build file. First, let's
-# make the structures that we will be filling during the parse.
+# The Ninja build format is whitespace-sensitive.
 
-# Contains the rules for building the statements
-rules = {}
-
-# Contains the build targets and their dependencies
-Statement = namedtuple("Statement", "rule deps")
-statements = {}
-
-# The targets to build
-targets = []
-
-# The parser we're building will be made up of small functions that parse
-# different sections of the build file. The parser will run each function in
-# succession until we are out of lines to parse. This is where we will keep the
-# functions.
-
-parsers = []
-
-# Check if a line is completely empty, then remove it.  This is the simplest
-# function we can write, but it doesn't get too complicated.
-def parse_whitespace(lines):
-    assert lines[0].strip() == ""
-    lines.pop(0)
+Block = namedtuple("Block", "directive variables")
 
 
-parsers.append(parse_whitespace)
+def indented(line):
+    if not line:
+        return False
+    else:
+        return line[0] in [" ", "\t"]
 
 
-# Parse build statements. These are in the form `build TARGET: RULE DEPS`. They
-# can actually contain more information, but this is a simplified
-# implementation.
-def parse_build(lines):
-    action = lines[0].split(" ", 1)[0]
-    assert action == "build"
-
-    line = lines.pop(0)
-    p1, p2 = line.split(":")
-    target = p1.split(" ")[1]
-    p2 = list(filter(None, p2.split(" ")))
-    rule = p2[0]
-    deps = p2[1:]
-    stm = Statement(rule, deps)
-    statements[target] = stm
-
-
-parsers.append(parse_build)
-
-
-# Parses the default command. The format is `default target1 target2...`. This
-# command is used to set the default targets to build.
-def parse_default(lines):
-    parts = lines[0].split(" ")
-    assert parts[0] == "default"
-
-    # Filter out the empty strings and add the rest to targets.
-    for target in filter(None, parts[1:]):
-        targets.append(target)
-
-    # Finally, consume the line we just read
-    lines.pop(0)
-
-
-parsers.append(parse_default)
-
-
-def parse_rule(lines):
-    rule, name = lines[0].split(" ", 1)
-    assert rule == "rule"
-    lines.pop(0)
-
-    data = {}
-    while True:
-        l = lines[0]
-        if l.startswith(" "):
-            l = lines.pop(0)
-            key, val = l.split("=", 1)
-            key = key.strip()
-            val = val.strip()
-            data[key] = val
-        else:
-            break
-
-    rules[name] = data
-
-
-parsers.append(parse_rule)
-
-# That's all the parsing code we're going to write.  Let's run them in a loop
-# until all the input is consumed.
-
-for parser in cycle(parsers):
+def get_variable(line):
     try:
-        parser(lines)
+        name, value = line.split("=", 1)
+        name = name.strip()
+        value = value.strip()
+        return name, value
     except:
-        pass
+        return None
 
-    if not len(lines):
-        break
+
+def get_blocks(lines):
+    lines = list(lines)
+
+    block = None
+
+    for line in lines:
+        var = get_variable(line)
+
+        if var:
+            name, value = var
+            if indented(line):
+                block.variables[name] = value
+            else:
+                yield Block(None, {name: value})
+        else:
+            if block:
+                yield block
+            block = Block(line, {})
+    yield block
+
+
+blocks = list(get_blocks(lines))
+
+# ------------------------------------------------------------------------------
+Rule = namedtuple("Rule", "name")
+Build = namedtuple("Build", "target rule deps")
+Default = namedtuple("Default", "targets")
+
+
+def parse_directive(block):
+    if not block.directive:
+        return block
+
+    command, arg = block.directive.split(" ", 1)
+
+    directive = None
+
+    if command == "build":
+        target, deps = arg.split(":")
+        deps = list(filter(None, deps.split(" ")))
+        rule = deps[0]
+        deps = deps[1:]
+
+        directive = Build(target, rule, deps)
+    elif command == "rule":
+        directive = Rule(arg)
+    elif command == "default":
+        targets = list(filter(None, arg.split(" ")))
+        directive = Default(targets)
+    return Block(directive, block.variables)
+
+
+blocks = list(map(parse_directive, blocks))
+
+# Some helper functions to search the blocks
+
+
+def get_build(target):
+    for block in blocks:
+        if (
+            isinstance(block.directive, Build)
+            and block.directive.target == target
+        ):
+            return block
+
+
+def get_rule(name):
+    for block in blocks:
+        if isinstance(block.directive, Rule) and block.directive.name == name:
+            return block
+
 
 # ------------------------------------------------------------------------------
 
@@ -188,11 +194,20 @@ for parser in cycle(parsers):
 # If there are no targets specified with the default command or with command
 # line arguments, build everything. Otherwise, build the targets.
 
+targets = set()
+
+for block in blocks:
+    if isinstance(block.directive, Default):
+        for target in block.directive.targets:
+            targets.add(target)
+
 if not targets:
-    for target in statements:
-        targets.append(target)
+    for block in blocks:
+        if isinstance(block.directive, Build):
+            targets.add(block.directive.target)
+
 if args.targets:
-    targets = args.targets
+    targets = set(args.targets)
 
 # But the list of targets is not all we need to start building the code. The
 # files might have multiple dependencies and go through different build
@@ -206,7 +221,7 @@ build_list = []  # Ordered list of how to build things
 
 perm = set()  # Permanent marker
 temp = set()  # Temporary marker
-unmarked = set(targets)  # Unmarked nodes, i.e. build targets
+unmarked = targets  # Unmarked nodes, i.e. build targets
 
 
 def visit(n):
@@ -219,8 +234,9 @@ def visit(n):
 
     temp.add(n)
 
-    if n in statements:
-        for dep in statements[n].deps:
+    block = get_build(n)
+    if block:
+        for dep in block.directive.deps:
             visit(dep)
 
     temp.remove(n)
@@ -238,20 +254,36 @@ while unmarked or temp:
 # things in order, everything will work out. So let's do that.
 
 for target in build_list:
-    # Check if  we know how to  build the target.  If we don't, it's  probably a
-    # code file or generated by another command.
-    if target not in statements:
+
+    build = get_build(target)
+    if not build:
         continue
 
-    # Get the statement and the rule
-    statement = statements[target]
-    rule = rules[statement.rule]
+    rule = get_rule(build.directive.rule)
 
     # Get the  command from the  rule, and do  a quick variable  substitution to
     # replace the input and output file names.
-    cmd = rule["command"]
-    cmd = cmd.replace("$in", " ".join(statement.deps))
-    cmd = cmd.replace("$out", target)
+    cmd = rule.variables["command"]
+
+    variables = {}
+
+    for block in blocks:
+        if block.directive is None:
+            for key in block.variables:
+                variables[key] = block.variables[key]
+
+    for key in rule.variables:
+        variables[key] = rule.variables[key]
+
+    for key in build.variables:
+        variables[key] = build.variables[key]
+
+    variables["in"] = " ".join(build.directive.deps)
+    variables["out"] = target
+
+    for var in re.findall("\$(\S+)", cmd):
+        value = variables[var]
+        cmd = cmd.replace(f"${var}", value)
 
     # If the verbose flag is passed, print the command that we are about to run
     if args.verbose:
