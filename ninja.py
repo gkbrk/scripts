@@ -20,7 +20,6 @@
 
 from pathlib import Path
 from collections import namedtuple
-from itertools import cycle
 import os, sys, argparse, re
 
 # Self-contained, limited implementation of the Ninja build system
@@ -70,21 +69,24 @@ if not build_file.exists():
     print("Build file not found")
     sys.exit(1)
 
-# Read the build file. Strip trailing whitespace from the lines.
+# Read the build file, do minimal preprocessing
 
 lines = []
 with open(build_file) as bf:
     bf = iter(bf)
     for line in bf:
+        # Strip traling whitespace from lines
         line = line.rstrip()
 
         # Ignore empty lines
         if not line:
             continue
+
         # Ignore comments
         if line.lstrip().startswith("#"):
             continue
 
+        # Lines ending with $ are joined to the next line
         while line.endswith("$"):
             line = line[:-1] + next(bf).strip()
 
@@ -112,6 +114,9 @@ def get_variable(line):
         return name, value
     except:
         return None
+
+
+# Performs basic lexing
 
 
 def get_blocks(lines):
@@ -155,7 +160,9 @@ def replace_variables(line, bl=None):
         for key in bl.variables:
             variables[key] = bl.variables[key]
 
-    for _ in range(5):
+    prev = None
+    while prev != line:
+        prev = line
         for var in re.findall("\$([A-Za-z0-9]+)", line):
             if var in variables:
                 line = line.replace(f"${var}", variables[var])
@@ -268,7 +275,7 @@ def visit(n):
 
     block = get_build(n)
     if block:
-        nodes = block.directive.deps
+        nodes = list(block.directive.deps)
         nodes += block.directive.impl
         nodes += block.directive.order
         for dep in nodes:
@@ -288,12 +295,10 @@ while unmarked or temp:
 # With the topological sort out of the way, we now know that if we just build
 # things in order, everything will work out. So let's do that.
 
-for target in build_list:
+build_list = list(filter(get_build, build_list))
 
+for i, target in enumerate(build_list):
     build = get_build(target)
-    if not build:
-        continue
-
     rule = get_rule(build.directive.rule)
 
     # Get the  command from the  rule, and do  a quick variable  substitution to
@@ -304,9 +309,13 @@ for target in build_list:
     cmd = cmd.replace("$in", " ".join(build.directive.deps))
     cmd = cmd.replace("$out", target)
 
+    progress = f"[{i+1}/{len(build_list)}]"
+
     # If the verbose flag is passed, print the command that we are about to run
     if args.verbose:
-        print(cmd)
+        print(progress, cmd)
+    else:
+        print(progress, build.directive.rule.upper(), target)
 
     # If we are not in a dry run, execute the command
     if not args.dry_run:
