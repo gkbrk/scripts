@@ -139,15 +139,35 @@ blocks = list(get_blocks(lines))
 
 # ------------------------------------------------------------------------------
 Rule = namedtuple("Rule", "name")
-Build = namedtuple("Build", "target rule deps")
+Build = namedtuple("Build", "target rule deps impl order")
 Default = namedtuple("Default", "targets")
+
+
+def replace_variables(line, bl=None):
+    variables = {}
+
+    for block in blocks:
+        if block.directive is None:
+            for key in block.variables:
+                variables[key] = block.variables[key]
+
+    if bl:
+        for key in bl.variables:
+            variables[key] = bl.variables[key]
+
+    for _ in range(5):
+        for var in re.findall("\$([A-Za-z0-9]+)", line):
+            if var in variables:
+                line = line.replace(f"${var}", variables[var])
+    return line
 
 
 def parse_directive(block):
     if not block.directive:
         return block
 
-    command, arg = block.directive.split(" ", 1)
+    directive = replace_variables(block.directive, block)
+    command, arg = directive.split(" ", 1)
 
     directive = None
 
@@ -155,9 +175,21 @@ def parse_directive(block):
         target, deps = arg.split(":")
         deps = list(filter(None, deps.split(" ")))
         rule = deps[0]
-        deps = deps[1:]
 
-        directive = Build(target, rule, deps)
+        expl = []
+        impl = []
+        order = []
+
+        bucket = expl
+        for dep in deps[1:]:
+            if dep == "|":
+                bucket = impl
+            elif dep == "||":
+                bucket = order
+            else:
+                bucket.append(dep)
+
+        directive = Build(target, rule, expl, impl, order)
     elif command == "rule":
         directive = Rule(arg)
     elif command == "default":
@@ -236,7 +268,10 @@ def visit(n):
 
     block = get_build(n)
     if block:
-        for dep in block.directive.deps:
+        nodes = block.directive.deps
+        nodes += block.directive.impl
+        nodes += block.directive.order
+        for dep in nodes:
             visit(dep)
 
     temp.remove(n)
@@ -265,25 +300,9 @@ for target in build_list:
     # replace the input and output file names.
     cmd = rule.variables["command"]
 
-    variables = {}
-
-    for block in blocks:
-        if block.directive is None:
-            for key in block.variables:
-                variables[key] = block.variables[key]
-
-    for key in rule.variables:
-        variables[key] = rule.variables[key]
-
-    for key in build.variables:
-        variables[key] = build.variables[key]
-
-    variables["in"] = " ".join(build.directive.deps)
-    variables["out"] = target
-
-    for var in re.findall("\$(\S+)", cmd):
-        value = variables[var]
-        cmd = cmd.replace(f"${var}", value)
+    cmd = replace_variables(cmd, build)
+    cmd = cmd.replace("$in", " ".join(build.directive.deps))
+    cmd = cmd.replace("$out", target)
 
     # If the verbose flag is passed, print the command that we are about to run
     if args.verbose:
