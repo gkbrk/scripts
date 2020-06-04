@@ -298,6 +298,9 @@ while unmarked or temp:
 build_list = list(filter(get_build, build_list))
 
 for i, target in enumerate(build_list):
+    # Create directory
+    Path(target).parent.mkdir(parents=True, exist_ok=True)
+
     build = get_build(target)
     rule = get_rule(build.directive.rule)
 
