@@ -295,7 +295,14 @@ while unmarked or temp:
 # With the topological sort out of the way, we now know that if we just build
 # things in order, everything will work out. So let's do that.
 
+# Only build the targets that we have build rules for. Anything else is probably
+# a code file or the result of a previous command.
 build_list = list(filter(get_build, build_list))
+
+def progress(i):
+    total = len(build_list)
+    width = len(str(total))
+    return f"[{i+1:>{width}}/{total}]"
 
 for i, target in enumerate(build_list):
     # Create directory
@@ -307,19 +314,30 @@ for i, target in enumerate(build_list):
     # Get the  command from the  rule, and do  a quick variable  substitution to
     # replace the input and output file names.
     cmd = rule.variables["command"]
-
     cmd = replace_variables(cmd, build)
+
+    # TODO: in and out should be scoped variables in the build statement
     cmd = cmd.replace("$in", " ".join(build.directive.deps))
     cmd = cmd.replace("$out", target)
 
-    progress = f"[{i+1}/{len(build_list)}]"
+    description = f"{build.directive.rule.upper()} {target}"
+
+    # Rules can include human-readable descriptions for pretty-printing
+    if "description" in rule.variables:
+        description = rule.variables["description"]
+
+        # TODO: Cleanup duplication
+        description = description.replace("$in", " ".join(build.directive.deps))
+        description = description.replace("$out", target)
 
     # If the verbose flag is passed, print the command that we are about to run
     if args.verbose:
-        print(progress, cmd)
-    else:
-        print(progress, build.directive.rule.upper(), target)
+        description = cmd
+
+    print(progress(i), description)
 
     # If we are not in a dry run, execute the command
     if not args.dry_run:
+        # TODO: Run with subprocess?
+        # TODO: Abort build if a command fails
         os.system(cmd)
