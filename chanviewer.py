@@ -76,6 +76,7 @@
 # - Implement "New Thread"
 # - Catalog search
 # - Config file
+# - Wrap really long words that prevent word-wrap from working
 #
 ################################################################################
 
