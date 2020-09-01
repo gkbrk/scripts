@@ -20,7 +20,7 @@ import sys
 from collections import defaultdict
 from decimal import Decimal
 
-PATH = sys.argv[1]
+# File parser
 
 
 class Block:
@@ -61,6 +61,9 @@ class BlockLexer:
         for line in self.reader:
             line = line.rstrip()
 
+            # Inline comments
+            line = line.split(";", 1)[0]
+
             if not line:
                 continue
 
@@ -87,9 +90,17 @@ def read_blocks(path):
         yield from BlockLexer(f)
 
 
+# Ledger and bookkeeping logic
+
+
+def warn_strict(message, condition=True):
+    if args.strict and condition:
+        print(f"[WARNING] {message}")
+
+
 class Ledger:
     def __init__(self):
-        self.commodities = []
+        self.commodities = set()
         self.accounts = defaultdict(lambda: defaultdict(lambda: Decimal(0)))
 
     def process_block(self, block):
@@ -97,15 +108,16 @@ class Ledger:
             return
 
         if block.name == "commodity":
-            com = block.arg.split(" ", 1)
-            self.commodities.append(com)
+            com = block.arg.split(" ", 1)[0]
+            warn_strict(f"Duplicate commodity '{com}'", com in self.commodities)
+            self.commodities.add(com)
         elif block.name == ";":
             # Comment
             return
         elif block.name == "txn":
             self.process_transaction(block)
         else:
-            print(f"[WARNING] Unknown directive '{block.name}'")
+            warn_strict(f"Unknown directive '{block.name}'")
 
     def process_transaction(self, block):
         total = defaultdict(lambda: Decimal())
@@ -118,6 +130,12 @@ class Ledger:
                     total[com] = 0
             else:
                 account, amount, commodity = line.split(" ", 2)
+
+                warn_strict(
+                    f"Unknown commodity '{commodity}'",
+                    commodity not in self.commodities,
+                )
+
                 total[commodity] += Decimal(amount)
                 self.accounts[account][commodity] += Decimal(amount)
 
@@ -133,26 +151,93 @@ class Ledger:
             assert total[com] == 0, f"{total[com]} {com}"
 
 
+# Command line interface
+
+
+class Arguments:
+    def __init__(self, args=None):
+        if args is None:
+            args = sys.argv[1:]
+        self.args = list(args)
+        self.file = self.args.pop(0)
+        self.action = self.args.pop(0)
+
+    @property
+    def accounts(self):
+        accounts = []
+
+        prev = ""
+        for arg in self.args:
+            p = prev.startswith("-")
+            a = arg.startswith("-")
+            if not p and not a:
+                accounts.append(arg)
+            prev = arg
+        return accounts
+
+    def filtered_accounts(self, ledger):
+        accounts = sorted(ledger.accounts)
+
+        if args.accounts:
+            act = []
+            for account in accounts:
+                if any(map(lambda x: account.startswith(x), self.accounts)):
+                    act.append(account)
+            return act
+        return accounts
+
+    @property
+    def strict(self):
+        return "--strict" in self.args
+
+
+subcommands = {}
+
+
+def subcommand(name=None):
+    def decorator(func):
+        subcommands[name or func.__name__] = func
+
+    return decorator
+
+
+@subcommand()
+def check():
+    ledger.consistency_check()
+
+
+@subcommand()
+def accounts():
+    for name in args.filtered_accounts(ledger):
+        print(name)
+
+
+@subcommand()
+def balance():
+    total = defaultdict(lambda: Decimal())
+    accounts = args.filtered_accounts(ledger)
+
+    w = max(accounts, key=lambda x: len(x))
+    w = len(w)
+
+    for name in accounts:
+        for com in sorted(ledger.accounts[name]):
+            amt = ledger.accounts[name][com]
+            total[com] += amt
+            if amt != 0:
+                print(f"{name: <{w}}  {amt} {com}")
+
+    print("\nTotal:")
+    for com in total:
+        amt = total[com]
+        if amt != 0:
+            print(f"  {amt} {com}")
+
+
+args = Arguments()
 ledger = Ledger()
 
-for block in read_blocks(PATH):
+for block in read_blocks(args.file):
     ledger.process_block(block)
 
-total = defaultdict(lambda: Decimal())
-for name in sorted(ledger.accounts):
-    if not name.startswith(sys.argv[2]):
-        continue
-    print(name)
-    for com in sorted(ledger.accounts[name]):
-        amt = ledger.accounts[name][com]
-        total[com] += amt
-        if amt != 0:
-            print(f"    {amt} {com}")
-
-print("\nTotal:")
-for com in total:
-    amt = total[com]
-    if amt != 0:
-        print(f"  {amt} {com}")
-
-ledger.consistency_check()
+subcommands[args.action]()
