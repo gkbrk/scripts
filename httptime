@@ -1,0 +1,232 @@
+#!/usr/bin/env python3
+"""Small utility to detect and correct time skew of the system clock
+
+This utility can update your system time based on the Date header of an HTTP
+response. This is useful in cases where you need to update your time without an
+NTP daemon.
+
+"""
+
+import datetime
+import gc
+import socket
+import sys
+import time
+
+
+addr = ("1.1.1.1", 80)
+"""The address of the HTTP server to connect to.
+
+This can be any HTTP server as long as the server time is reasonably accurate.
+
+"""
+
+# The script will display the time skew without any arguments. If the --set
+# argument is passed, it sets the system time instead.
+_set = "--set" in sys.argv[1:]
+
+
+def send_request(f):
+    """Send a HEAD request to the server.
+
+    This function sends a HEAD request to the server. It uses TCP sockets
+    instead of an HTTP library in order to minimize the number of unnecessary
+    data.
+
+    This helps reduce the data transfer and makes the timing more accurate.
+
+    Parameters
+    ----------
+    f : file
+        The file object that is bound to the socket.
+
+    Returns
+    -------
+    None
+
+    """
+
+    f.write(b"HEAD /.well-known/time HTTP/1.1\r\n")
+    f.write(f"Host: {addr[0]}\r\n".encode("ascii"))
+    f.write(b"User-Agent: httptime\r\n\r\n")
+    f.flush()
+
+
+def parse_http_date(date):
+    """Parse an HTTP date into a Unix timestamp.
+
+    Parameters
+    ----------
+    date : str
+        The date to parse (from the HTTP header)
+
+    Returns
+    -------
+    float
+        Unix timestamp of the parsed date
+
+    """
+    fmt = "%a, %d %b %Y %H:%M:%S GMT"
+    dt = datetime.datetime.strptime(date, fmt)
+    return dt.replace(tzinfo=datetime.timezone.utc).timestamp()
+
+
+def get_time(f):
+    """Get the current datetime from the server
+
+    This function makes an HTTP request to the server, parses the date header
+    and returns it as a timestamp.
+
+    Parameters
+    ----------
+    f : file
+        The file object that is bound to the socket
+
+    Returns
+    -------
+    transmit : float
+        The timestamp of when the request was sent.
+    receive : float
+        The timestamp of when the response was received.
+    datetime : float
+        The date header returned by the server parsed into a unix timestamp
+
+    """
+    tr = time.time()
+    send_request(f)
+
+    dh = ""
+
+    for line in f:
+        line = line.strip()
+
+        if line.startswith(b"Date: "):
+            dh = line[6:].decode("ascii")
+
+        # An empty line in a HEAD request means the reponse is completed.
+        if not line:
+            rc = time.time()
+            return tr, rc, parse_http_date(dh)
+
+
+def get_skew(f, N):
+    """Determine the time skew by making N requests to the server.
+
+    Usually 4 iterations is enough for an accurate sync and anything above 8
+    doesn't provide extra accuracy.
+
+    Parameters
+    ----------
+    f : file
+        The file object that is bound to the socket.
+    N : int
+        The number of requests to make.
+
+    Returns
+    -------
+    float
+        The time skew in seconds.
+
+    Notes
+    -----
+    The `Date` header has a one second granularity, but it is possible to get
+    more sub-second accuracy by making multiple requests and timing them
+    correctly.
+
+    The data has one-second resolution, but we can get more accuracy out of it
+    if we can determine at which point it is 10:15:12.000 instead of just
+    10:15:12.
+
+    The function maintains two values through the iterations, the lower bound of
+    the time skew and the upper bound of the time skew.
+
+    At the end of each iteration, we determine how much time we need to sleep in
+    order to align ourselves better with the passing of each second on the
+    server. The better aligned we are, the smaller the spread between the upper
+    and lower bounds.
+
+    Once the spread is small enough, or we do a certain number of iterations, we
+    can get the mean value of the upper and lower bounds, and use that as the
+    skew.
+
+    """
+    lower = float("-inf")
+    upper = float("inf")
+
+    for i in range(N):
+        transmit, receive, ts = get_time(f)
+
+        _lower = (transmit - 1) - ts
+        _upper = receive - ts
+        rtt = receive - transmit
+
+        lower = max(_lower, lower)
+        upper = min(_upper, upper)
+
+        dt = 0.5 * (lower + upper) - 0.5 * rtt
+
+        if i == N - 1:
+            return (lower + upper) * 0.5
+        catch_up = frac(dt - frac(time.time()))
+        time.sleep(catch_up)
+
+
+def frac(n):
+    """
+    Return the fractional part of a time value.
+
+    Parameters
+    ----------
+    n : int
+        The time value
+
+    Returns
+    -------
+    int
+        Fractional part of the time value
+    """
+    n = n - int(n)
+    if n < 0:
+        n = 1 + n
+    return n
+
+def set_time(skew):
+    """Corrects the time skew by using the settime call.
+
+    Parameters
+    ----------
+    skew : float
+        The time skew in seconds
+    
+    Returns
+    -------
+    None
+
+    Raises
+    ------
+    PermissionError
+        If the current user does not have permission to change the system clock.
+
+    See Also
+    --------
+    time.clock_settime : Sets the system time
+
+    """
+
+    new_time = time.time() - skew
+    time.clock_settime(time.CLOCK_REALTIME, new_time)
+
+if __name__ == "__main__":
+    gc.disable()
+    conn = socket.create_connection(addr)
+    f = conn.makefile("rwb")
+
+    skew = get_skew(f, 8)
+    conn.close()
+
+    if _set:
+        set_time(skew)
+    elif skew > 0:
+        print(f"Your time is {skew} seconds ahead")
+    else:
+        print(f"Your time is {abs(skew)} seconds behind")
