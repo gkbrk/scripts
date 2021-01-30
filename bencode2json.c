@@ -29,7 +29,15 @@
 #include <ctype.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <unistd.h>
 #include <stdlib.h>
+
+/* Use seccomp in Linux */
+#ifdef __linux__
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#include <linux/seccomp.h>
+#endif
 
 /* Configuration */
 #define MAX_INT_LEN 50
@@ -40,9 +48,21 @@
    to other places.
 */
 
+static int unget = -1;
+
 /* Reads one byte of bencoded input. */
-static int get_character() {
-  return getc(stdin);
+static char get_character() {
+  char c[1];
+  char ch;
+
+  if (unget >= 0) {
+    ch = unget;
+    unget = -1;
+    return ch;
+  }
+
+  read(0, c, 1);
+  return c[0];
 }
 
 /* Unreads one character of input.
@@ -52,12 +72,12 @@ static int get_character() {
  *
  */
 static void unget_character(char c) {
-  ungetc(c, stdin);
+  unget = c;
 }
 
 /* Outputs a single character. */
 static void output_character(char c) {
-  putc(c, stdout);
+  write(1, &c, 1);
 }
 
 /*
@@ -79,9 +99,9 @@ static void convert_value();
 
 static void convert_list() {
   uint8_t output = 0;
-  
+
   output_character('[');
-  
+
   for (;;) {
     char c = get_character();
 
@@ -94,7 +114,7 @@ static void convert_list() {
     output = 1;
     convert_value();
   }
-  
+
   output_character(']');
 }
 
@@ -129,17 +149,17 @@ static size_t read_count() {
 
   for (;;) {
     char c = get_character();
-    
+
     if (c == ':')
       break;
-    
+
     lenBufLen++;
     lenBuf[lenBufLen - 1] = c;
     if (lenBufLen >= MAX_INT_LEN)
       break;
   }
   lenBuf[lenBufLen] = 0;
-  
+
   return atoi(lenBuf);
 }
 
@@ -150,9 +170,9 @@ static void convert_string() {
   size_t count = read_count();
   char byte[3];
   size_t i;
-    
+
   output_character('"');
-  
+
   for (i = 0; i < count; i++) {
     char c = get_character();
 
@@ -175,7 +195,7 @@ static void convert_string() {
       output_character(byte[1]);
     }
   }
-  
+
   output_character('"');
 }
 
@@ -204,8 +224,17 @@ static void convert_value() {
 }
 
 int main(void) {
+  /* Use seccomp on Linux */
+  #ifdef __linux__
+  prctl(PR_SET_SECCOMP, SECCOMP_MODE_STRICT);
+  #endif
+
   /* Only convert a single value. This can be any data type including
      dictionary. */
   convert_value();
+
+  #ifdef __linux__
+  syscall(SYS_exit, 0);
+  #endif
   return 0;
 }
