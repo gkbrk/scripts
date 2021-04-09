@@ -71,10 +71,10 @@
 # TODO List and planned features
 ################################################################################
 #
+# - Click on images to enlarge
 # - Authentication with Pass
 # - Posting replies to threads
 # - Implement "New Thread"
-# - Catalog search
 # - Config file
 # - Wrap really long words that prevent word-wrap from working
 #
@@ -87,12 +87,21 @@ from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 import threading
 import time
+from collections import defaultdict
+import sys
 
 # GUI Stuff
 import gi
 
 gi.require_version("Gtk", "3.0")
 from gi.repository import Gtk, GLib, Gdk, GdkPixbuf
+
+################################################################################
+# Configuration
+################################################################################
+# This section contains the configuration variables
+################################################################################
+proxy = None
 
 ################################################################################
 # In-memory Cache
@@ -103,7 +112,7 @@ from gi.repository import Gtk, GLib, Gdk, GdkPixbuf
 #
 ################################################################################
 
-__cache_data = {}
+_cache_data = {}
 
 
 def cache_or_func(key, func, ttl):
@@ -125,14 +134,14 @@ def cache_or_func(key, func, ttl):
     """
     t = time.monotonic()
 
-    if key in __cache_data:
-        value, expire_time = __cache_data[key]
+    if key in _cache_data:
+        value, expire_time = _cache_data[key]
 
         if expire_time > t:
             return value
 
     value = func()
-    __cache_data[key] = value, t + ttl
+    _cache_data[key] = value, t + ttl
     return value
 
 
@@ -140,14 +149,15 @@ def cache_gc():
     """Clean up the expired keys from the cache"""
     t = time.monotonic()
 
-    for key in list(__cache_data.keys()):
-        _, expire_time = __cache_data[key]
+    for key in list(_cache_data.keys()):
+        _, expire_time = _cache_data[key]
 
         if expire_time < t:
-            del __cache_data[key]
+            del _cache_data[key]
     return True
 
 
+# Routinely attempt to garbage-collect cached data.
 GLib.timeout_add_seconds(10, cache_gc)
 
 
@@ -160,12 +170,13 @@ GLib.timeout_add_seconds(10, cache_gc)
 #
 ################################################################################
 
-thread_pool = ThreadPoolExecutor(max_workers=4)
+thread_pools = defaultdict(lambda: ThreadPoolExecutor(max_workers=4))
 
 
 class ThreadWidget(Gtk.Frame):
     def __init__(self):
         super().__init__()
+        self.pool = "default"
 
     def __clear(self):
         for ch in self.get_children():
@@ -189,7 +200,8 @@ class ThreadWidget(Gtk.Frame):
 
     def reload(self):
         self.__spinner()
-        future = thread_pool.submit(self.load)
+        pool = thread_pools[self.pool]
+        future = pool.submit(self.load)
         future.add_done_callback(self.__glib_idle)
 
     def build_ui(self):
@@ -291,6 +303,10 @@ class Chan:
         self.sess = requests.Session()
         self.sess.headers["User-Agent"] = "Python/ChanViewer v0.0"
 
+        if proxy:
+            pd = {"http": proxy, "https": proxy}
+            self.sess.proxies = pd
+
     def get_cached(self, url, ttl):
         def inner():
             req = self.sess.get(url)
@@ -301,7 +317,7 @@ class Chan:
     @property
     def boards(self):
         url = f"{self.A}/boards.json"
-        boards = self.get_cached(url, 60 * 15)
+        boards = self.get_cached(url, 60 * 60)
         return boards["boards"]
 
     def catalog(self, board):
@@ -332,6 +348,7 @@ class Chan:
 class ThumbnailImage(ThreadWidget):
     def __init__(self, url):
         super().__init__()
+        self.pool = "thumbnail-downloader"
         self.url = url
         self.reload()
 
@@ -350,6 +367,9 @@ class ThumbnailImage(ThreadWidget):
     @property
     def image_content(self):
         def inner():
+            if proxy:
+                pd = {"http": proxy, "https": proxy}
+                return requests.get(self.url, proxies=pd).content
             return requests.get(self.url).content
 
         return cache_or_func(f"url_{self.url}", inner, 60 * 15)
@@ -562,6 +582,7 @@ class Catalog(ThreadWidget):
         with vbox(3) as page:
             with hbox(5) as top:
                 search = Gtk.SearchEntry()
+                search.connect("search-changed", self.search_changed)
                 top.pack_start(search, True, True, 0)
                 new = Gtk.Button.new_with_label("New thread")
                 new.connect("clicked", self.new_thread)
@@ -579,9 +600,27 @@ class Catalog(ThreadWidget):
             self.add(page)
 
     def display(self, threads):
+        self.all_threads = []
+        self.thread_widgets = []
+
         for thread in threads:
             widget = thread_widget(thread, self.board)
             self.threads.add(widget)
+            self.thread_widgets.append(widget)
+            self.all_threads.append(thread)
+
+    def search_changed(self, search):
+        text = search.get_text()
+
+        for w in list(self.threads.get_children()):
+            self.threads.remove(w)
+
+        for i, thread in enumerate(self.all_threads):
+            search = thread.title.lower() + thread.comment.lower()
+            if not text or text.lower() in search:
+                self.threads.add(self.thread_widgets[i])
+
+        self.show_all()
 
     def load(self):
         return list(chan.catalog(self.board))
@@ -658,6 +697,7 @@ class ChanViewer(Gtk.Window):
         self.notebook.connect("page-removed", self.tab_number_changed)
         self.add(self.notebook)
 
+        self.create_tab(cv_about(), "ChanViewer")
         self.create_tab(Boards(), "Boards")
 
     def create_tab(self, widget, title):
@@ -701,6 +741,142 @@ class ChanViewer(Gtk.Window):
             widget.reload()
 
 
+class RefreshingWidget(Gtk.Bin):
+    def __init__(self):
+        super().__init__()
+        self.interval = 1
+        self.mapped = False
+        self.timer()
+        self.connect("realize", self._on_map)
+        self.connect("unrealize", self._on_unmap)
+
+    def _on_map(self, *_):
+        self.mapped = True
+        self.timer()
+
+    def _on_unmap(self, *_):
+        self.mapped = False
+
+    def timer(self):
+        try:
+            self.refresh()
+        except:
+            pass
+
+        if self.mapped:
+            GLib.timeout_add_seconds(self.interval, self.timer)
+
+        return False
+
+    def refresh(self):
+        pass
+
+
+class CacheControlWidget(RefreshingWidget):
+    def __init__(self):
+        super().__init__()
+        self.add(self.build_ui())
+
+    def build_ui(self):
+        fr = Gtk.Frame.new("Cache settings")
+        box = Gtk.Box.new(Gtk.Orientation.VERTICAL, 5)
+
+        self.num = Gtk.Label.new()
+        box.add(self.num)
+        self.size = Gtk.Label.new()
+        box.add(self.size)
+
+        btn = Gtk.Button.new_with_label("Clear cache")
+        btn.connect("clicked", self.clear_cache)
+        box.add(btn)
+        set_margin(box, 10)
+
+        fr.add(box)
+        set_margin(fr, 50)
+        return fr
+
+    def clear_cache(self, *_):
+        _cache_data.clear()
+
+    def refresh(self):
+        self.num.set_markup(f"{len(_cache_data)} pieces of data in the cache")
+
+        cache = dict(_cache_data)
+        early = min(cache, key=lambda x: cache[x][1])
+        es = cache[early][1] - time.monotonic()
+        late = max(cache, key=lambda x: cache[x][1])
+        ls = cache[late][1] - time.monotonic()
+
+        self.size.set_text(
+            f"Early ({int(es)} sec) -> {early}\nLate ({int(ls)} sec) -> {late}"
+        )
+
+
+class ThreadPoolsWidget(RefreshingWidget):
+    def __init__(self):
+        super().__init__()
+        self.add(self.build_ui())
+
+    def build_ui(self):
+        fr = Gtk.Frame.new("Thread pools")
+        self.box = Gtk.Box.new(Gtk.Orientation.VERTICAL, 5)
+        fr.add(self.box)
+        set_margin(self.box, 10)
+        set_margin(fr, 50)
+
+        return fr
+
+    def refresh(self):
+        for c in self.box.get_children():
+            self.box.remove(c)
+
+        for tp in thread_pools:
+            w = Gtk.Box.new(Gtk.Orientation.HORIZONTAL, 5)
+            w.add(Gtk.Label.new(tp))
+            w.add(Gtk.Label.new(str(thread_pools[tp]._work_queue.qsize())))
+
+            def cl(*_):
+                while not thread_pools[tp]._work_queue.empty():
+                    thread_pools[tp]._work_queue.get()
+
+            btn = Gtk.Button.new_with_label("Clear tasks")
+            btn.connect("clicked", cl)
+            w.add(btn)
+            self.box.add(w)
+
+        self.box.show_all()
+
+
+class cv_about(Gtk.Frame):
+    def __init__(self):
+        super().__init__()
+        self.reload()
+
+    def reload(self):
+        for c in self.get_children():
+            self.remove(c)
+
+        box = Gtk.Box.new(Gtk.Orientation.VERTICAL, 15)
+        swin = Gtk.ScrolledWindow()
+        swin.add(box)
+        self.add(swin)
+
+        def label(text):
+            l = Gtk.Label.new()
+            l.set_markup(text)
+            box.add(l)
+
+        label("Welcome to <i>ChanViewer</i>")
+        label(
+            "This page has internal settings and information.\nTry not to break anything..."
+        )
+
+        box.add(CacheControlWidget())
+        box.add(ThreadPoolsWidget())
+
+        self.show_all()
+
+
 chan = Chan()
 
 win = ChanViewer()
@@ -709,6 +885,11 @@ win.show_all()
 
 win.create_tab(Catalog("g"), "/g/ Catalog")
 
+# This function will block until Gtk.main_quit is called.
 Gtk.main()
 
-thread_pool.shutdown()
+# Do not wait to clean up resources, exiting the app should be instant.
+
+import os
+
+os._exit(0)
