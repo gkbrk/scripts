@@ -71,7 +71,6 @@
 # TODO List and planned features
 ################################################################################
 #
-# - Click on images to enlarge
 # - Authentication with Pass
 # - Posting replies to threads
 # - Implement "New Thread"
@@ -112,54 +111,108 @@ proxy = None
 #
 ################################################################################
 
-_cache_data = {}
+
+class MemoryCache:
+    def __init__(self):
+        self._data = {}
+
+    def cache_or_func(self, key, func, ttl):
+        """
+        Fetch the result from the cache, or fall back to a callable
+
+        Parameters
+        ----------
+        key : str
+            The cache key that uniquely represents the cached resource
+        func
+            Callable that calculates and returns the result to be cached
+        ttl : int
+            Time-to-live. How long a value should be cached for, in seconds.
+
+        Returns
+        -------
+        The value, either retrieved from the cache or the result of calling
+        func
+        """
+        t = time.monotonic()
+
+        if key in self._data:
+            value, expire_time = self._data[key]
+
+            if expire_time > t:
+                return value
+
+        value = func()
+        self._data[key] = value, t + ttl
+        return value
+
+    def garbage_collect(self):
+        """Clean up the expired keys from the cache"""
+        t = time.monotonic()
+
+        for key in list(self._data.keys()):
+            _, expire_time = self._data[key]
+
+            if expire_time < t:
+                del self._data[key]
+        return True
+
+    @property
+    def first(self):
+        data = dict(self._data)
+        key = min(data, key=lambda x: data[x][1])
+        _, t = data[key]
+        return key, t - time.monotonic()
+
+    @property
+    def last(self):
+        data = dict(self._data)
+        key = max(data, key=lambda x: data[x][1])
+        _, t = data[key]
+        return key, t - time.monotonic()
+
+    def clear(self):
+        self._data.clear()
+
+    def __len__(self):
+        return len(self._data)
 
 
-def cache_or_func(key, func, ttl):
-    """
-    Fetch the result from the cache, or fall back to a callable
-
-    Parameters
-    ----------
-    key : str
-        The cache key that uniquely represents the cached resource
-    func
-        Callable that calculates and returns the result to be cached
-    ttl : int
-        Time-to-live. How long a value should be cached for, in seconds.
-
-    Returns
-    -------
-    The value, either retrieved from the cache or the result of calling func
-    """
-    t = time.monotonic()
-
-    if key in _cache_data:
-        value, expire_time = _cache_data[key]
-
-        if expire_time > t:
-            return value
-
-    value = func()
-    _cache_data[key] = value, t + ttl
-    return value
-
-
-def cache_gc():
-    """Clean up the expired keys from the cache"""
-    t = time.monotonic()
-
-    for key in list(_cache_data.keys()):
-        _, expire_time = _cache_data[key]
-
-        if expire_time < t:
-            del _cache_data[key]
-    return True
-
+cache = MemoryCache()
 
 # Routinely attempt to garbage-collect cached data.
-GLib.timeout_add_seconds(10, cache_gc)
+GLib.timeout_add_seconds(10, cache.garbage_collect)
 
+
+class HTTPClient:
+    def __init__(self):
+        self._sess = requests.session()
+        self._sess.headers["User-Agent"] = "Python/ChanViewer v0.0"
+
+        if proxy:
+            pd = {"http": proxy, "https": proxy}
+            self._sess.proxies = pd
+
+    @property
+    def session(self):
+        return self._sess
+
+    def get_json(self, url, ttl):
+        def inner():
+            req = self._sess.get(url)
+            return req.json()
+
+        return cache.cache_or_func(f"url_{url}", inner, ttl)
+
+    def get_content(self, url, ttl):
+        def inner():
+            req = self._sess.get(url)
+            return req.content
+
+        return cache.cache_or_func(f"binary_{url}", inner, ttl)
+
+
+http = HTTPClient()
 
 ################################################################################
 # Thread pool
@@ -173,7 +226,7 @@ GLib.timeout_add_seconds(10, cache_gc)
 thread_pools = defaultdict(lambda: ThreadPoolExecutor(max_workers=4))
 
 
-class ThreadWidget(Gtk.Frame):
+class ThreadWidget(Gtk.Bin):
     def __init__(self):
         super().__init__()
         self.pool = "default"
@@ -187,7 +240,7 @@ class ThreadWidget(Gtk.Frame):
 
     def __update_ui(self, future):
         self.__clear()
-        self.build_ui()
+        self.add(self.build_ui())
         self.display(future.result())
         self.show_all()
 
@@ -221,12 +274,9 @@ class CatalogThread:
 
     @property
     def status(self):
-        t = "<i>"
-        t += str(self.data.get("replies"))
-        t += " replies, "
-        t += str(self.data.get("images"))
-        t += " images</i>"
-        return t
+        r = self.data.get("replies")
+        i = self.data.get("images")
+        return f"<i>{r} replies, {i} images</i>"
 
     @property
     def title(self):
@@ -250,6 +300,19 @@ class CatalogThread:
         tim = self.data.get("tim")
         ext = self.data.get("ext")
         return f"{base}/{self.board}/{tim}s.jpg"
+
+    @property
+    def media(self):
+        if "tim" not in self.data:
+            return
+        base = chan.I
+        tim = self.data.get("tim")
+        ext = self.data.get("ext")
+        return f"{base}/{self.board}/{tim}{ext}"
+
+    @property
+    def filename(self):
+        return self.data.get("filename") + self.data.get("ext")
 
 
 class Post:
@@ -284,6 +347,19 @@ class Post:
         ext = self.data.get("ext")
         return f"{base}/{self.board}/{tim}s.jpg"
 
+    @property
+    def media(self):
+        if "tim" not in self.data:
+            return
+        base = chan.I
+        tim = self.data.get("tim")
+        ext = self.data.get("ext")
+        return f"{base}/{self.board}/{tim}{ext}"
+
+    @property
+    def filename(self):
+        return self.data.get("filename") + self.data.get("ext")
+
 
 ################################################################################
 # API Client
@@ -299,30 +375,15 @@ class Chan:
     A = "https://a.4cdn.org"
     I = "https://i.4cdn.org"
 
-    def __init__(self):
-        self.sess = requests.Session()
-        self.sess.headers["User-Agent"] = "Python/ChanViewer v0.0"
-
-        if proxy:
-            pd = {"http": proxy, "https": proxy}
-            self.sess.proxies = pd
-
-    def get_cached(self, url, ttl):
-        def inner():
-            req = self.sess.get(url)
-            return req.json()
-
-        return cache_or_func(f"url_{url}", inner, ttl)
-
     @property
     def boards(self):
         url = f"{self.A}/boards.json"
-        boards = self.get_cached(url, 60 * 60)
+        boards = http.get_json(url, 60 * 60)
         return boards["boards"]
 
     def catalog(self, board):
         url = f"{self.A}/{board}/catalog.json"
-        pages = self.get_cached(url, 60 * 2)
+        pages = http.get_json(url, 60 * 2)
         for page in pages:
             for thread in page["threads"]:
                 thread = CatalogThread(thread, board)
@@ -330,7 +391,7 @@ class Chan:
 
     def thread(self, board, thread):
         url = f"{self.A}/{board}/thread/{thread}.json"
-        thread = self.get_cached(url, 60)
+        thread = http.get_json(url, 60)
         for post in thread["posts"]:
             yield Post(post, board)
 
@@ -346,17 +407,28 @@ class Chan:
 
 
 class ThumbnailImage(ThreadWidget):
-    def __init__(self, url):
+    def __init__(self, post):
         super().__init__()
         self.pool = "thumbnail-downloader"
-        self.url = url
+        self.post = post
         self.reload()
 
-    def display(self, pixbuf):
-        img = Gtk.Image.new()
-        img.set_from_pixbuf(pixbuf)
-        self.add(img)
+    def build_ui(self):
         set_margin(self, 5)
+
+        btn = Gtk.Button.new()
+        btn.connect("clicked", self.enlarge)
+
+        self.img = Gtk.Image.new()
+        btn.add(self.img)
+        return btn
+
+    def enlarge(self, _):
+        img = ImageViewer(self.post.media)
+        win.create_tab(img, "[IMG] " + self.post.filename)
+
+    def display(self, pixbuf):
+        self.img.set_from_pixbuf(pixbuf)
 
     def load(self):
         loader = GdkPixbuf.PixbufLoader()
@@ -366,13 +438,30 @@ class ThumbnailImage(ThreadWidget):
 
     @property
     def image_content(self):
-        def inner():
-            if proxy:
-                pd = {"http": proxy, "https": proxy}
-                return requests.get(self.url, proxies=pd).content
-            return requests.get(self.url).content
+        return http.get_content(self.post.thumbnail, 60 * 15)
 
-        return cache_or_func(f"url_{self.url}", inner, 60 * 15)
+
+class ImageViewer(ThreadWidget):
+    def __init__(self, url):
+        super().__init__()
+        self.pool = "image-downloader"
+        self.url = url
+        self.reload()
+
+    def build_ui(self):
+        scr = Gtk.ScrolledWindow.new()
+        self.img = Gtk.Image.new()
+        scr.add(self.img)
+        return scr
+
+    def display(self, pixbuf):
+        self.img.set_from_pixbuf(pixbuf)
+
+    def load(self):
+        loader = GdkPixbuf.PixbufLoader()
+        loader.write(http.get_content(self.url, 60 * 15))
+        loader.close()
+        return loader.get_pixbuf()
 
 
 class PostWidget(Gtk.Frame):
@@ -403,7 +492,7 @@ class PostWidget(Gtk.Frame):
 
         hb = Gtk.Box.new(Gtk.Orientation.HORIZONTAL, 0)
         if self.post.thumbnail:
-            th = ThumbnailImage(self.post.thumbnail)
+            th = ThumbnailImage(self.post)
             hb.add(th)
 
         hb.pack_start(body, False, True, 0)
@@ -423,10 +512,32 @@ class ThreadPage(ThreadWidget):
         self.reload()
 
     def build_ui(self):
-        self.posts = Gtk.Box.new(Gtk.Orientation.VERTICAL, 5)
+        fr = Gtk.Frame.new()
+        box = Gtk.Box.new(Gtk.Orientation.VERTICAL, 5)
+        actions = Gtk.Box.new(Gtk.Orientation.HORIZONTAL, 5)
+
+        actions.add(Gtk.Button.new_with_label("Reply"))
+
         scr = Gtk.ScrolledWindow.new()
+
+        def scroll(t):
+            t = {"top": Gtk.ScrollType.START, "bot": Gtk.ScrollType.END}[t]
+            scr.emit("scroll-child", t, False)
+
+        top = Gtk.Button.new_with_label("Top")
+        top.connect("clicked", lambda _: scroll("top"))
+        actions.add(top)
+
+        bot = Gtk.Button.new_with_label("Bottom")
+        bot.connect("clicked", lambda _: scroll("bot"))
+        actions.add(bot)
+
+        self.posts = Gtk.Box.new(Gtk.Orientation.VERTICAL, 5)
         scr.add(self.posts)
-        self.add(scr)
+        box.pack_start(actions, False, False, 1)
+        box.pack_end(scr, True, True, 1)
+        fr.add(box)
+        return fr
 
     def display(self, posts):
         for post in posts:
@@ -540,7 +651,7 @@ def thread_widget(thread, board):
     with vbox() as vb:
         with hbox() as hb:
             if thread.thumbnail:
-                th = ThumbnailImage(thread.thumbnail)
+                th = ThumbnailImage(thread)
                 hb.add(th)
 
             label = Gtk.Label.new()
@@ -597,7 +708,7 @@ class Catalog(ThreadWidget):
 
             set_margin(page, 10)
 
-            self.add(page)
+            return page
 
     def display(self, threads):
         self.all_threads = []
@@ -676,7 +787,7 @@ class Boards(ThreadWidget):
         self.box = Gtk.Box.new(Gtk.Orientation.VERTICAL, 15)
         swin = Gtk.ScrolledWindow()
         swin.add(self.box)
-        self.add(swin)
+        return swin
 
     def display(self, boards):
         for board in boards:
@@ -693,6 +804,7 @@ class ChanViewer(Gtk.Window):
         self.connect("key-press-event", self.key_press)
 
         self.notebook = Gtk.Notebook()
+        self.notebook.set_scrollable(True)
         self.notebook.connect("page-added", self.tab_number_changed)
         self.notebook.connect("page-removed", self.tab_number_changed)
         self.add(self.notebook)
@@ -779,16 +891,13 @@ class CacheControlWidget(RefreshingWidget):
 
     def build_ui(self):
         fr = Gtk.Frame.new("Cache settings")
-        box = Gtk.Box.new(Gtk.Orientation.VERTICAL, 5)
-
-        self.num = Gtk.Label.new()
-        box.add(self.num)
-        self.size = Gtk.Label.new()
-        box.add(self.size)
+        box = Gtk.Box.new(Gtk.Orientation.HORIZONTAL, 5)
+        self.box = Gtk.Box.new(Gtk.Orientation.VERTICAL, 5)
 
         btn = Gtk.Button.new_with_label("Clear cache")
         btn.connect("clicked", self.clear_cache)
         box.add(btn)
+        box.add(self.box)
         set_margin(box, 10)
 
         fr.add(box)
@@ -796,20 +905,32 @@ class CacheControlWidget(RefreshingWidget):
         return fr
 
     def clear_cache(self, *_):
-        _cache_data.clear()
+        cache.clear()
 
     def refresh(self):
-        self.num.set_markup(f"{len(_cache_data)} pieces of data in the cache")
+        for b in self.box.get_children():
+            self.box.remove(b)
 
-        cache = dict(_cache_data)
-        early = min(cache, key=lambda x: cache[x][1])
-        es = cache[early][1] - time.monotonic()
-        late = max(cache, key=lambda x: cache[x][1])
-        ls = cache[late][1] - time.monotonic()
+        def markup(text):
+            l = Gtk.Label.new()
+            l.set_markup(text)
+            self.box.add(l)
 
-        self.size.set_text(
-            f"Early ({int(es)} sec) -> {early}\nLate ({int(ls)} sec) -> {late}"
-        )
+        if not len(cache):
+            markup("The cache is empty")
+        else:
+            markup(f"{len(cache)} pieces of data in the cache")
+
+        try:
+            early, es = cache.first
+            late, ls = cache.last
+
+            markup(f"Early ({int(es)}) -> {early}")
+            markup(f"Late ({int(ls)}) -> {late}")
+        except:
+            pass
+
+        self.box.show_all()
 
 
 class ThreadPoolsWidget(RefreshingWidget):
