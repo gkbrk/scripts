@@ -98,12 +98,15 @@ def http_get(url: str) -> bytes:
     """Returns the data from the URL"""
 
     def inner():
+        import gzip
         req = urllib.request.Request(url)
 
         for key, value in default_headers.items():
             req.add_header(key, value)
 
         with urllib.request.urlopen(req) as response:
+            if response.info().get("Content-Encoding") == "gzip":
+                return gzip.decompress(response.read())
             return response.read()
 
     return cache_or(f"HTTP_GET_{url}", inner)
