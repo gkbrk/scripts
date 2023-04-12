@@ -98,4 +98,7 @@ then
 fi
 """
 
-subprocess.run(["git", "filter-branch", "-f", "--env-filter", env_filter])
+subprocess.run(
+    ["git", "filter-branch", "-f", "--env-filter", env_filter],
+    env={"FILTER_BRANCH_SQUELCH_WARNING": "1"}
+)
