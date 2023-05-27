@@ -19,6 +19,7 @@
 import sys
 from collections import defaultdict
 from decimal import Decimal
+import os
 
 # File parser
 
@@ -31,12 +32,32 @@ class Block:
         return len(self.lines) != 0
 
     @property
+    def is_comment(self):
+        try:
+            return self.lines[0][0] in ";#%|*"
+        except Exception:
+            return False
+
+    @property
+    def date(self):
+        try:
+            return self.lines[0].split(" ", 2)[0]
+        except Exception:
+            return "1970-01-01"
+
+    @property
     def name(self):
-        return self.lines[0].split(" ", 1)[0].lower()
+        try:
+            return self.lines[0].split(" ", 2)[1].lower()
+        except Exception:
+            return ""
 
     @property
     def arg(self):
-        return self.lines[0].split(" ", 1)[1]
+        try:
+            return self.lines[0].split(" ", 2)[2]
+        except Exception:
+            return ""
 
     @property
     def children(self):
@@ -61,9 +82,6 @@ class BlockLexer:
         for line in self.reader:
             line = line.rstrip()
 
-            # Inline comments
-            line = line.split(";", 1)[0]
-
             if not line:
                 continue
 
@@ -71,11 +89,9 @@ class BlockLexer:
 
     def __iter__(self):
         block = []
-        prev = ""
 
         for line in self.lines:
             ind = BlockLexer.indented(line)
-            prev_ind = BlockLexer.indented(prev)
 
             if ind:
                 block.append(line.strip())
@@ -102,20 +118,55 @@ class Ledger:
     def __init__(self):
         self.commodities = set()
         self.accounts = defaultdict(lambda: defaultdict(lambda: Decimal(0)))
+        self.rates = defaultdict(lambda: Decimal(0))
 
     def process_block(self, block):
         if not block:
             return
 
+        if block.is_comment:
+            return
+
+        if block.name == "nop":
+            # No operation
+            return
         if block.name == "commodity":
             com = block.arg.split(" ", 1)[0]
-            warn_strict(f"Duplicate commodity '{com}'", com in self.commodities)
+            warn_strict(
+                f"Duplicate commodity '{com}'", com in self.commodities
+            )
             self.commodities.add(com)
-        elif block.name == ";":
-            # Comment
-            return
         elif block.name == "txn":
             self.process_transaction(block)
+        elif block.name == "include":
+            for bl in read_blocks(block.arg):
+                self.process_block(bl)
+        elif block.name == "assert-balance":
+            name, amt, com = block.arg.split()
+            amt = Decimal(amt)
+
+            bal = self.accounts[name][com]
+            warn_strict(
+                f"Expected balance for {name} is {amt}, found {bal}",
+                bal != amt,
+            )
+        elif block.name == "balance":
+            name, amt, com = block.arg.split()
+            amt = Decimal(amt)
+
+            bal = self.accounts[name][com]
+            if bal == amt:
+                return
+
+            if bal > amt:
+                self.accounts["Expenses:ForceBalance"][com] += bal - amt
+                self.accounts[name][com] -= bal - amt
+            elif amt > bal:
+                self.accounts["Income:ForceBalance"][com] -= amt - bal
+                self.accounts[name][com] += amt - bal
+        elif block.name == "price":
+            com1, rate, com2 = block.arg.split()
+            self.rates[(com1, com2)] = Decimal(rate)
         else:
             warn_strict(f"Unknown directive '{block.name}'")
 
@@ -138,6 +189,8 @@ class Ledger:
 
                 total[commodity] += Decimal(amount)
                 self.accounts[account][commodity] += Decimal(amount)
+        # print(block)
+        # self.consistency_check()
 
     def consistency_check(self):
         total = defaultdict(lambda: Decimal())
@@ -166,13 +219,10 @@ class Arguments:
     def accounts(self):
         accounts = []
 
-        prev = ""
         for arg in self.args:
-            p = prev.startswith("-")
             a = arg.startswith("-")
-            if not p and not a:
+            if not a:
                 accounts.append(arg)
-            prev = arg
         return accounts
 
     def filtered_accounts(self, ledger):
@@ -234,10 +284,107 @@ def balance():
             print(f"  {amt} {com}")
 
 
+def print_table(table, fmt=None):
+    table = [[str(x) for x in row] for row in table]
+    col_num = len(max(table, key=len))
+    col_w = [0 for _ in range(col_num)]
+
+    if not fmt:
+        fmt = [">" for _ in range(col_num)]
+
+    for col in range(col_num):
+        col_w[col] = len(max(map(lambda x: x[col], table), key=len))
+
+    for row in table:
+        for i, col in enumerate(row):
+            print(f"{col: {fmt[i]}{col_w[i]}}", end="  ")
+        print()
+
+
+@subcommand("converted-balance")
+def convertedbalance():
+    accounts = args.filtered_accounts(ledger)
+
+    w = max(accounts, key=len)
+    w = len(w)
+
+    rates = ledger.rates
+    for _ in range(10):
+        for com1, com2 in dict(rates):
+            rel = (com1, com2)
+            rev = (com2, com1)
+
+            if rates[rev] == 0:
+                rates[rev] = 1 / rates[rel]
+
+    def conv_rate(com1, com2):
+        q = []
+        discovered = set()
+        parents = {}
+
+        amt = 1
+        discovered.add(com1)
+        q.append(com1)
+
+        while len(q):
+            v = q.pop()
+            if v == com2:
+                amt = 1
+                n = com2
+                while n in parents:
+                    amt *= rates[(parents[n], n)]
+                    n = parents[n]
+                return amt
+
+            for _com1, _com2 in filter(lambda x: x[0] == v, rates):
+                if _com2 not in discovered:
+                    discovered.add(_com2)
+                    q.append(_com2)
+                    parents[_com2] = _com1
+        return 0
+
+    for target in os.environ.get("CURRENCY", "EUR,TRY,USD").split(","):
+        grand_total = 0
+
+        totals = {}
+        for name in accounts:
+            total = 0
+            for com in ledger.accounts[name]:
+                amt = ledger.accounts[name][com]
+                if amt != 0:
+                    conv = conv_rate(com, target)
+                    total += amt * conv
+            grand_total += total
+            if total != 0:
+                totals[name] = total
+
+        table = []
+        table.append(["Name", "Total", "Currency", "Percentage %"])
+        table.append(["----", "-----", "--------", "------------"])
+        for name in totals:
+            total = totals[name]
+            row = []
+
+            row.append(name)
+            row.append(f"{total:.2f}")
+            row.append(target)
+
+            perc = total / grand_total * 100
+            row.append(f"{perc:.2f}")
+
+            table.append(row)
+        table.append(["----", "-----", "--------", "------------"])
+        table.append(["Total", f"{grand_total:.2f}", target, "100"])
+        print_table(table, ["<", ">", "<", ">"])
+        print("\n")
+
+
 args = Arguments()
 ledger = Ledger()
 
-for block in read_blocks(args.file):
+blocks = read_blocks(args.file)
+
+for block in sorted(blocks, key=lambda x: x.date):
     ledger.process_block(block)
 
 subcommands[args.action]()
