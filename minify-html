@@ -1,19 +1,44 @@
 #!/usr/bin/env python3
-from bs4 import BeautifulSoup, NavigableString, Comment
-import sys
 from pathlib import Path
+import json
+import subprocess
+import sys
 
-def out(*t):
+from bs4 import BeautifulSoup, NavigableString, Comment
+
+
+def sassc(css: str) -> str:
+    """Minify CSS using the sassc compiler.
+
+    Parameters
+    ----------
+    css : str
+        The CSS to minify.
+
+    Returns
+    -------
+    str
+        The minified CSS.
+    """
+    cmd = ["sassc", "-t", "compressed", "-s"]
+    css_buf = css.encode("utf-8")
+    return subprocess.check_output(cmd, input=css_buf).decode("utf-8").strip()
+
+
+def out(f, *t):
     for x in t:
         f.write(x)
 
-def htmlentities(s):
-    s = s.replace("&", "&amp;")
-    s = s.replace("<", "&lt;")
-    s = s.replace(">", "&gt;")
-    return s
 
-def output_elem(tag, ws=False, escape=False):
+def htmlentities(text: str) -> str:
+    """Convert special characters to HTML entities."""
+    text = text.replace("&", "&amp;")
+    text = text.replace("<", "&lt;")
+    text = text.replace(">", "&gt;")
+    return text
+
+
+def output_elem(f, tag, ws=False, escape=False):
     if isinstance(tag, Comment):
         return
     if isinstance(tag, NavigableString):
@@ -22,42 +47,74 @@ def output_elem(tag, ws=False, escape=False):
         if escape:
             s = htmlentities(s)
         if ws:
-            out(s)
+            out(f, s)
             return
-        
+
         s = s.replace("\n", " ")
 
         new = ""
         while new != s:
             new = s
             s = new.replace("  ", " ")
-        out(new)
+        out(f, new)
         return
 
-    out("<", tag.name)
+    out(f, "<", tag.name)
 
     for attr in sorted(tag.attrs):
         x = tag.attrs[attr]
         if isinstance(x, list):
             x = " ".join(x)
-        out(" ", attr, '="', htmlentities(x), '"')
-    if not list(tag.children) and tag.name in ["meta", "input", "br", "hr", "link"]:
-        out("/>")
+        if attr == "style":
+            x = f".c {{ {x} }}"
+            x = sassc(x)
+            x = x.rstrip("}")
+            x = x.rstrip(";")
+            x = x.lstrip(".c")
+            x = x.lstrip(" ")
+            x = x.lstrip("{")
+        out(f, " ", attr, '="', htmlentities(x), '"')
+    if not list(tag.children) and tag.name in [
+        "meta",
+        "input",
+        "br",
+        "hr",
+        "link",
+        "img",
+    ]:
+        out(f, "/>")
         return
-    out(">")
+    out(f, ">")
 
     for ch in tag.children:
-        output_elem(ch, ws or tag.name in ["textarea", "script", "style", "pre"], tag.name not in ["script", "style"])
+        if (
+            tag.name == "script"
+            and tag.attrs.get("type") == "application/ld+json"
+        ):
+            out(f, json.dumps(json.loads(tag.string), separators=(",", ":")))
+        elif tag.name == "style":
+            out(f, sassc(tag.string))
+        else:
+            output_elem(
+                f,
+                ch,
+                ws
+                or tag.name in ["textarea", "script", "style", "pre"]
+                or "pre-wrap" in tag.attrs.get("style", ""),
+                tag.name not in ["script", "style"],
+            )
 
-    out("</", tag.name, ">")
+    out(f, "</", tag.name, ">")
+
+
+def minify_path(p):
+    with Path(p).open("r") as f:
+        orig = f.read()
+        soup = BeautifulSoup(orig, "html5lib")
+        with Path(p).open("w") as f:
+            out(f, "<!DOCTYPE html>")
+            output_elem(f, soup.html)
+
 
 for p in sys.argv[1:]:
-    print(f"Minifying {p}...")
-    try:
-        with Path(p).open("r") as f:
-            soup = BeautifulSoup(f.read(), "html.parser")
-            with Path(p).open("w") as f:
-                out("<!DOCTYPE html>")
-                output_elem(soup.html)
-    except:
-        pass
+    minify_path(p)
