@@ -251,6 +251,9 @@ class ExtensionProvider:
     def install(self, data: str):
         raise NotImplementedError()
 
+    def download(self, data: str) -> str:
+        raise NotImplementedError()
+
 
 class OpenVSXProvider(ExtensionProvider):
     def name(self):
@@ -279,6 +282,11 @@ class VSCodeProvider(ExtensionProvider):
         url = VSCodeProvider.find_download_url(data)
         path = download_file(url)
         install_vsix(path)
+
+    def download(self, data: str):
+        url = VSCodeProvider.find_download_url(data)
+        path = download_file(url)
+        return path
 
     @staticmethod
     def find_download_url(name: str) -> str:
@@ -404,6 +412,25 @@ def action_restore():
             printn(f"Unknown method `{method}`, skipping {data}")
 
 
+def action_download():
+    target = Path(os.environ["VSIXTARGET"]).resolve()
+    assert target.is_dir()
+
+    for p in target.iterdir():
+        printn(f"Deleting existing file {p}...")
+        assert p.is_file()
+        subprocess.run(["rm", "-f", p])
+
+    for method, data in parse_extensions_file():
+        if method in PROVIDERS:
+            prov = PROVIDERS[method]
+            printn(f"Downloading {data} from {prov.name()}...")
+            p = prov.download(data)
+            subprocess.run(["cp", p, target], check=False)
+        else:
+            printn(f"Unknown method `{method}`")
+
+
 def action_providers():
     print("Available providers")
     print("-------------------")
@@ -433,6 +460,9 @@ subparsers = parser.add_subparsers(
 # Restore sub-command
 restore_parser = subparsers.add_parser("restore", help="Restore extensions")
 restore_parser.set_defaults(func=action_restore)
+
+download_parser = subparsers.add_parser("download", help="Download")
+download_parser.set_defaults(func=action_download)
 
 # Providers sub-command
 providers_parser = subparsers.add_parser(
